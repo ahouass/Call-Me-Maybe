@@ -2,7 +2,9 @@
 """Generate complete function calls with constrained decoding."""
 
 import json
+import re
 from typing import Any
+from .regex_decoder import generate_regex
 
 from llm_sdk import Small_LLM_Model
 
@@ -36,6 +38,14 @@ class FunctionDecoder:
 
         prompt = build_prompt(request, functions)
 
+        source_numbers = set(
+            re.findall(
+                r"(?<![\w.])-?(?:0|[1-9]\d*)"
+                r"(?:\.\d+)?(?:[eE][+-]?\d+)?(?![\w.])",
+                request
+            )
+        )
+
         name = generate_name(
             self.model,
             prompt,
@@ -48,6 +58,9 @@ class FunctionDecoder:
             if item.name == name
         )
 
+        # Only the selected function is needed for its arguments.
+        argument_prompt = build_prompt(request, [selected])
+
         output = (
             '{"name":'
             + json.dumps(name)
@@ -55,6 +68,9 @@ class FunctionDecoder:
         )
 
         parameters = list(selected.parameters.items())
+
+        # Store generated parameter values
+        parameter_values: dict[str, Any] = {}
 
         for index, (key, definition) in enumerate(parameters):
             last = index == len(parameters) - 1
@@ -64,23 +80,43 @@ class FunctionDecoder:
 
             if definition.type == "number":
                 input_ids = self.model.encode(
-                    prompt + output
+                    argument_prompt + output
                 ).tolist()[0]
 
                 value = generate_number(
                     self.model,
                     input_ids,
                     self.tokens,
-                    delimiter
+                    delimiter,
+                    source_numbers=source_numbers
                 )
 
                 output += value + delimiter
+                parameter_values[key] = json.loads(value)
+
+            elif (
+                definition.type == "string"
+                and key == "regex"
+                and isinstance(
+                    parameter_values.get("source_string"),
+                    str
+                )
+            ):
+                pattern = generate_regex(
+                    self.model,
+                    request,
+                    parameter_values["source_string"],
+                    self.tokens
+                )
+
+                output += json.dumps(pattern) + delimiter
+                parameter_values[key] = pattern
 
             elif definition.type == "string":
                 output += '"'
 
                 input_ids = self.model.encode(
-                    prompt + output
+                    argument_prompt + output
                 ).tolist()[0]
 
                 value = generate_json_string(
@@ -91,6 +127,7 @@ class FunctionDecoder:
                 )
 
                 output += value + delimiter
+                parameter_values[key] = json.loads('"' + value)
 
             else:
                 raise ValueError(

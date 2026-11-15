@@ -33,7 +33,8 @@ def generate_number(
     input_ids: list[int],
     ascii_tokens: dict[int, str],
     delimiter: str,
-    max_number_length: int = 12
+    max_number_length: int = 12,
+    source_numbers: set[str] | None = None
 ) -> str:
     """Generate a number with constrained token selection."""
     delimiter_id = next(
@@ -101,6 +102,18 @@ def generate_number(
         token = ascii_tokens[next_id]
         generated += token
         input_ids.append(next_id)
+
+        # Finish early when Qwen has produced a complete
+        # numeric literal present in the user's request.
+        if (
+            source_numbers is not None
+            and generated in source_numbers
+            and check_number_prefix(generated)
+            == ParseStatus.COMPLETE
+        ):
+            input_ids.append(delimiter_id)
+            print("Completed source number:", repr(generated))
+            return generated
 
         print("Generated:", repr(generated))
 
