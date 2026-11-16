@@ -65,7 +65,6 @@ def load_text_tokens(
     return result
 
 
-
 def generate_json_string(
     model: Small_LLM_Model,
     input_ids: list[int],
@@ -129,8 +128,6 @@ def generate_json_string(
             return completed
 
     raise ValueError("String generation limit reached")
-
-
 
 
 def check_string_continuation(

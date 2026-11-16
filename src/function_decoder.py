@@ -2,16 +2,23 @@
 """Generate complete function calls with constrained decoding."""
 
 import json
-import re
 from typing import Any
-from .regex_decoder import generate_regex
 
 from llm_sdk import Small_LLM_Model
 
 from .models import FunctionDefinition
 from .name_decoder import generate_name
+from .number_choice import (
+    choose_source_number,
+    has_prefix_collision,
+)
 from .number_decoder import generate_number
+from .numeric_arguments import (
+    extract_named_numbers,
+    extract_source_numbers,
+)
 from .prompt_builder import build_prompt
+from .regex_decoder import generate_regex
 from .string_decoder import (
     generate_json_string,
     load_text_tokens,
@@ -38,14 +45,11 @@ class FunctionDecoder:
 
         prompt = build_prompt(request, functions)
 
-        source_numbers = set(
-            re.findall(
-                r"(?<![\w.])-?(?:0|[1-9]\d*)"
-                r"(?:\.\d+)?(?:[eE][+-]?\d+)?(?![\w.])",
-                request
-            )
-        )
+        # Extract numbers in their original order.
+        # Keep duplicates such as "5 and 5".
+        source_numbers = extract_source_numbers(request)
 
+        # Let Qwen select the requested function.
         name = generate_name(
             self.model,
             prompt,
@@ -58,7 +62,7 @@ class FunctionDecoder:
             if item.name == name
         )
 
-        # Only the selected function is needed for its arguments.
+        # Use a smaller prompt for argument generation.
         argument_prompt = build_prompt(request, [selected])
 
         output = (
@@ -69,8 +73,33 @@ class FunctionDecoder:
 
         parameters = list(selected.parameters.items())
 
-        # Store generated parameter values
+        # Identify numeric parameters in the selected function.
+        numeric_keys = [
+            key
+            for key, definition in parameters
+            if definition.type == "number"
+        ]
+
+        # Extract explicitly assigned numeric parameters.
+        # Example: "parameter b equal to 2".
+        named_numbers = extract_named_numbers(
+            request,
+            numeric_keys
+        )
+
         parameter_values: dict[str, Any] = {}
+
+        # Fast positional mapping is only used when no
+        # explicit numeric assignments were found.
+        ordered_numbers = (
+            not named_numbers
+            and len(parameters) > 0
+            and len(source_numbers) == len(parameters)
+            and all(
+                definition.type == "number"
+                for _, definition in parameters
+            )
+        )
 
         for index, (key, definition) in enumerate(parameters):
             last = index == len(parameters) - 1
@@ -79,17 +108,57 @@ class FunctionDecoder:
             output += json.dumps(key) + ":"
 
             if definition.type == "number":
-                input_ids = self.model.encode(
-                    argument_prompt + output
-                ).tolist()[0]
 
-                value = generate_number(
-                    self.model,
-                    input_ids,
-                    self.tokens,
-                    delimiter,
-                    source_numbers=source_numbers
-                )
+                # Priority 1: Explicit parameter assignment.
+                # Example: "parameter a equal to 265".
+                if key in named_numbers:
+                    value = named_numbers[key]
+
+                    print(
+                        f"Explicit parameter {key}: "
+                        f"{value!r}"
+                    )
+
+                # Priority 2: Ordered numeric arguments.
+                # Example: "What is the sum of 2 and 265?"
+                elif ordered_numbers:
+                    value = source_numbers[index]
+
+                    print(
+                        f"Mapped source number for {key}: "
+                        f"{value!r}"
+                    )
+
+                # Priority 3: Resolve numeric prefix collisions.
+                # Example: "2" and "265".
+                elif has_prefix_collision(source_numbers):
+                    value = choose_source_number(
+                        self.model,
+                        request,
+                        key,
+                        index,
+                        source_numbers,
+                        self.tokens
+                    )
+
+                    print(
+                        f"Selected source number for {key}: "
+                        f"{value!r}"
+                    )
+
+                # Priority 4: General constrained number decoding.
+                else:
+                    input_ids = self.model.encode(
+                        argument_prompt + output
+                    ).tolist()[0]
+
+                    value = generate_number(
+                        self.model,
+                        input_ids,
+                        self.tokens,
+                        delimiter,
+                        source_numbers=set(source_numbers)
+                    )
 
                 output += value + delimiter
                 parameter_values[key] = json.loads(value)
@@ -102,6 +171,7 @@ class FunctionDecoder:
                     str
                 )
             ):
+                # Generate a regex for the source string.
                 pattern = generate_regex(
                     self.model,
                     request,
@@ -113,6 +183,7 @@ class FunctionDecoder:
                 parameter_values[key] = pattern
 
             elif definition.type == "string":
+                # Generate a JSON string with token constraints.
                 output += '"'
 
                 input_ids = self.model.encode(
@@ -134,13 +205,16 @@ class FunctionDecoder:
                     f"Unsupported type: {definition.type}"
                 )
 
+        # Close the parameters object if it has no fields.
         if not parameters:
             output += "}"
 
+        # Close the outer function-call object.
         output += "}"
 
         result: dict[str, Any] = json.loads(output)
 
+        # Validate the final result against the function schema.
         if not validate_function_call(result, functions):
             raise ValueError("Generated call failed validation")
 

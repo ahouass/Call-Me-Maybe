@@ -1,8 +1,17 @@
 [
   {
-    "prompt": "Greet shrek"
+    "prompt": "Greet Alice Smith"
   },
   {
-    "prompt": "Replace all vowels in 'Programming is fun' with asterisks"
+    "prompt": "Greet O'Connor"
+  },
+  {
+    "prompt": "Reverse the string \"hello world\""
+  },
+  {
+    "prompt": "Reverse the string 'a\"b'"
+  },
+  {
+    "prompt": "Greet café"
   }
 ]

@@ -1,18 +1,37 @@
 [
   {
-    "prompt": "Greet shrek",
+    "prompt": "Greet Alice Smith",
     "name": "fn_greet",
     "parameters": {
-      "name": "shrek"
+      "name": "Alice Smith"
     }
   },
   {
-    "prompt": "Replace all vowels in 'Programming is fun' with asterisks",
-    "name": "fn_substitute_string_with_regex",
+    "prompt": "Greet O'Connor",
+    "name": "fn_greet",
     "parameters": {
-      "source_string": "Programming is fun",
-      "regex": "([aeiou])+",
-      "replacement": "*"
+      "name": "O'Connor"
+    }
+  },
+  {
+    "prompt": "Reverse the string \"hello world\"",
+    "name": "fn_reverse_string",
+    "parameters": {
+      "s": "hello world"
+    }
+  },
+  {
+    "prompt": "Reverse the string 'a\"b'",
+    "name": "fn_reverse_string",
+    "parameters": {
+      "s": "a"
+    }
+  },
+  {
+    "prompt": "Greet café",
+    "name": "fn_greet",
+    "parameters": {
+      "name": "cafe"
     }
   }
 ]

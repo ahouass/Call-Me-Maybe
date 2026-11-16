@@ -4,8 +4,6 @@
 from .models import FunctionDefinition
 
 
-
-
 def build_prompt(
     user_request: str,
     functions: list[FunctionDefinition]
