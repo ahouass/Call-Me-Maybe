@@ -2,10 +2,13 @@
 """Generate complete function calls with constrained decoding."""
 
 import json
+import re
 from typing import Any
 
 from llm_sdk import Small_LLM_Model
 
+from .boolean_decoder import generate_boolean
+from .integer_decoder import generate_integer
 from .models import FunctionDefinition
 from .name_decoder import generate_name
 from .number_choice import (
@@ -20,10 +23,14 @@ from .numeric_arguments import (
 from .prompt_builder import build_prompt
 from .regex_decoder import generate_regex
 from .string_decoder import (
+    explicit_string_hint,
     generate_json_string,
     load_text_tokens,
 )
 from .validator import validate_function_call
+
+
+INTEGER_PATTERN = r"-?(?:0|[1-9][0-9]*)"
 
 
 class FunctionDecoder:
@@ -45,11 +52,10 @@ class FunctionDecoder:
 
         prompt = build_prompt(request, functions)
 
-        # Extract numbers in their original order.
-        # Keep duplicates such as "5 and 5".
+        # Preserve number order and duplicate values.
         source_numbers = extract_source_numbers(request)
 
-        # Let Qwen select the requested function.
+        # Select the requested function using Qwen.
         name = generate_name(
             self.model,
             prompt,
@@ -73,15 +79,15 @@ class FunctionDecoder:
 
         parameters = list(selected.parameters.items())
 
-        # Identify numeric parameters in the selected function.
+        # Both number and integer parameters are numeric.
         numeric_keys = [
             key
             for key, definition in parameters
-            if definition.type == "number"
+            if definition.type in ("number", "integer")
         ]
 
-        # Extract explicitly assigned numeric parameters.
-        # Example: "parameter b equal to 2".
+        # Extract assignments such as:
+        # "parameter a equal to 265".
         named_numbers = extract_named_numbers(
             request,
             numeric_keys
@@ -89,15 +95,23 @@ class FunctionDecoder:
 
         parameter_values: dict[str, Any] = {}
 
-        # Fast positional mapping is only used when no
-        # explicit numeric assignments were found.
+        # Use ordered mapping only when all parameters
+        # are numeric and source values match their types.
         ordered_numbers = (
             not named_numbers
             and len(parameters) > 0
             and len(source_numbers) == len(parameters)
             and all(
-                definition.type == "number"
+                definition.type in ("number", "integer")
                 for _, definition in parameters
+            )
+            and all(
+                definition.type != "integer"
+                or re.fullmatch(
+                    INTEGER_PATTERN,
+                    source_numbers[index]
+                ) is not None
+                for index, (_, definition) in enumerate(parameters)
             )
         )
 
@@ -107,10 +121,26 @@ class FunctionDecoder:
 
             output += json.dumps(key) + ":"
 
-            if definition.type == "number":
+            # -----------------------------------------
+            # NUMBER AND INTEGER PARAMETERS
+            # -----------------------------------------
+            if definition.type in ("number", "integer"):
 
-                # Priority 1: Explicit parameter assignment.
-                # Example: "parameter a equal to 265".
+                # Integers cannot contain decimal points
+                # or scientific notation.
+                if definition.type == "integer":
+                    eligible_numbers = [
+                        number
+                        for number in source_numbers
+                        if re.fullmatch(
+                            INTEGER_PATTERN,
+                            number
+                        ) is not None
+                    ]
+                else:
+                    eligible_numbers = source_numbers
+
+                # Priority 1: Explicit named assignment.
                 if key in named_numbers:
                     value = named_numbers[key]
 
@@ -119,8 +149,7 @@ class FunctionDecoder:
                         f"{value!r}"
                     )
 
-                # Priority 2: Ordered numeric arguments.
-                # Example: "What is the sum of 2 and 265?"
+                # Priority 2: Ordered source numbers.
                 elif ordered_numbers:
                     value = source_numbers[index]
 
@@ -129,15 +158,14 @@ class FunctionDecoder:
                         f"{value!r}"
                     )
 
-                # Priority 3: Resolve numeric prefix collisions.
-                # Example: "2" and "265".
-                elif has_prefix_collision(source_numbers):
+                # Priority 3: Resolve numeric prefixes.
+                elif has_prefix_collision(eligible_numbers):
                     value = choose_source_number(
                         self.model,
                         request,
                         key,
                         index,
-                        source_numbers,
+                        eligible_numbers,
                         self.tokens
                     )
 
@@ -146,23 +174,50 @@ class FunctionDecoder:
                         f"{value!r}"
                     )
 
-                # Priority 4: General constrained number decoding.
+                # Priority 4: Token-constrained generation.
                 else:
                     input_ids = self.model.encode(
                         argument_prompt + output
                     ).tolist()[0]
 
-                    value = generate_number(
-                        self.model,
-                        input_ids,
-                        self.tokens,
-                        delimiter,
-                        source_numbers=set(source_numbers)
+                    if definition.type == "integer":
+                        value = generate_integer(
+                            self.model,
+                            input_ids,
+                            self.tokens,
+                            delimiter
+                        )
+
+                    else:
+                        value = generate_number(
+                            self.model,
+                            input_ids,
+                            self.tokens,
+                            delimiter,
+                            source_numbers=set(
+                                eligible_numbers
+                            )
+                        )
+
+                # Validate integer syntax even when
+                # the value came from source extraction.
+                if (
+                    definition.type == "integer"
+                    and re.fullmatch(
+                        INTEGER_PATTERN,
+                        value
+                    ) is None
+                ):
+                    raise ValueError(
+                        f"Invalid integer argument: {key}"
                     )
 
                 output += value + delimiter
                 parameter_values[key] = json.loads(value)
 
+            # -----------------------------------------
+            # REGEX STRING PARAMETERS
+            # -----------------------------------------
             elif (
                 definition.type == "string"
                 and key == "regex"
@@ -171,7 +226,6 @@ class FunctionDecoder:
                     str
                 )
             ):
-                # Generate a regex for the source string.
                 pattern = generate_regex(
                     self.model,
                     request,
@@ -182,8 +236,10 @@ class FunctionDecoder:
                 output += json.dumps(pattern) + delimiter
                 parameter_values[key] = pattern
 
+            # -----------------------------------------
+            # GENERAL STRING PARAMETERS
+            # -----------------------------------------
             elif definition.type == "string":
-                # Generate a JSON string with token constraints.
                 output += '"'
 
                 input_ids = self.model.encode(
@@ -194,18 +250,42 @@ class FunctionDecoder:
                     self.model,
                     input_ids,
                     self.tokens,
-                    suffix="}}" if last else ","
+                    suffix="}}" if last else ",",
+                    literal_hint=explicit_string_hint(
+                        request,
+                        key
+                    )
                 )
 
                 output += value + delimiter
                 parameter_values[key] = json.loads('"' + value)
 
+            # -----------------------------------------
+            # BOOLEAN PARAMETERS
+            # -----------------------------------------
+            elif definition.type == "boolean":
+                input_ids = self.model.encode(
+                    argument_prompt + output
+                ).tolist()[0]
+
+                value = generate_boolean(
+                    self.model,
+                    input_ids,
+                    self.tokens
+                )
+
+                output += value + delimiter
+                parameter_values[key] = json.loads(value)
+
+            # -----------------------------------------
+            # UNSUPPORTED PARAMETER TYPES
+            # -----------------------------------------
             else:
                 raise ValueError(
                     f"Unsupported type: {definition.type}"
                 )
 
-        # Close the parameters object if it has no fields.
+        # Close empty parameter objects.
         if not parameters:
             output += "}"
 
@@ -214,7 +294,7 @@ class FunctionDecoder:
 
         result: dict[str, Any] = json.loads(output)
 
-        # Validate the final result against the function schema.
+        # Validate the result against its function schema.
         if not validate_function_call(result, functions):
             raise ValueError("Generated call failed validation")
 
